@@ -6,7 +6,7 @@ A Discord music bot that plays YouTube audio in your server's voice channels. Ev
 
 | Command | What it does |
 |---|---|
-| `/play <link or search>` | Joins your voice channel and plays the song, or adds it to the queue |
+| `/play <link or search>` | Joins your voice channel and plays the song, or adds it to the queue. Accepts a YouTube playlist link too, and queues up to 100 of its songs. |
 | `/skip` | Skips the current song |
 | `/pause` / `/resume` | Pauses or resumes playback |
 | `/queue` | Shows what's playing now and what's next |

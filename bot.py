@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from collections import deque
 from dataclasses import dataclass
 
@@ -34,8 +35,15 @@ FFMPEG_OPTS = {
     "options": "-vn",
 }
 IDLE_DISCONNECT_SECONDS = 300
+MAX_PLAYLIST_TRACKS = 100
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
+# Lists a playlist's videos without resolving each one, so big playlists load fast.
+ytdl_playlist = yt_dlp.YoutubeDL(
+    YTDL_OPTS | {"noplaylist": False, "extract_flat": "in_playlist", "playlistend": MAX_PLAYLIST_TRACKS}
+)
+# "list=" in a YouTube URL, except auto-generated mixes (list=RD...), which never end.
+PLAYLIST_RE = re.compile(r"[?&]list=(?!RD)[\w-]+")
 
 
 @dataclass
@@ -61,6 +69,24 @@ async def search(query: str, requested_by: str) -> Track:
             raise LookupError("No results found.")
         info = info["entries"][0]
     return Track(info["title"], info["webpage_url"], info.get("duration"), requested_by)
+
+
+def is_playlist(query: str) -> bool:
+    return query.startswith(("http://", "https://")) and PLAYLIST_RE.search(query) is not None
+
+
+async def load_playlist(url: str, requested_by: str) -> tuple[str, list[Track]]:
+    """Resolve a playlist URL to its title and tracks (up to MAX_PLAYLIST_TRACKS)."""
+    info = await asyncio.to_thread(ytdl_playlist.extract_info, url, download=False)
+    tracks = [
+        Track(e["title"], e["url"], e.get("duration"), requested_by)
+        for e in info.get("entries") or []
+        # Private and deleted videos still show up in playlists but can't be played.
+        if e and e.get("url") and e.get("title") not in ("[Private video]", "[Deleted video]")
+    ]
+    if not tracks:
+        raise LookupError("That playlist has no playable videos.")
+    return info.get("title") or "playlist", tracks
 
 
 async def stream_url(track: Track) -> str:
@@ -225,8 +251,8 @@ async def require_same_channel(interaction: discord.Interaction) -> discord.Voic
     return vc  # type: ignore[return-value]
 
 
-@bot.tree.command(description="Play a song from YouTube (URL or search terms)")
-@app_commands.describe(query="YouTube link or what to search for")
+@bot.tree.command(description="Play a song or playlist from YouTube (URL or search terms)")
+@app_commands.describe(query="YouTube video or playlist link, or what to search for")
 @app_commands.guild_only()
 @dj_only()
 async def play(interaction: discord.Interaction, query: str):
@@ -245,7 +271,10 @@ async def play(interaction: discord.Interaction, query: str):
         return
 
     try:
-        track = await search(query, interaction.user.display_name)
+        if is_playlist(query):
+            playlist_title, tracks = await load_playlist(query, interaction.user.display_name)
+        else:
+            playlist_title, tracks = None, [await search(query, interaction.user.display_name)]
     except Exception as e:
         await interaction.followup.send(f"Couldn't find that: {e}")
         return
@@ -253,7 +282,17 @@ async def play(interaction: discord.Interaction, query: str):
     player = bot.player_for(interaction.guild)
     player.text_channel = interaction.channel
     busy = player.current is not None or bool(player.queue)
-    player.enqueue(track)
+    for t in tracks:
+        player.enqueue(t)
+
+    if playlist_title:
+        capped = f" (first {MAX_PLAYLIST_TRACKS})" if len(tracks) >= MAX_PLAYLIST_TRACKS else ""
+        await interaction.followup.send(
+            f"Queued **{len(tracks)}** songs{capped} from **{playlist_title}**"
+        )
+        return
+
+    track = tracks[0]
     if busy:
         await interaction.followup.send(
             f"Queued **{track.title}** [{track.fmt_duration()}] at position {len(player.queue)}"
