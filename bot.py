@@ -1,0 +1,335 @@
+import asyncio
+import logging
+import os
+from collections import deque
+from dataclasses import dataclass
+
+import discord
+import yt_dlp
+from discord import app_commands
+from dotenv import load_dotenv
+
+load_dotenv()
+TOKEN = os.environ["DISCORD_TOKEN"]
+# Optional: a server ID to sync slash commands to instantly while developing.
+DEV_GUILD_ID = os.environ.get("DEV_GUILD_ID")
+# Only members with this role (or server admins) can control playback.
+# If no role with this name exists in the server, everyone can.
+DJ_ROLE = os.environ.get("DJ_ROLE", "DJ")
+
+log = logging.getLogger("chopper")
+
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "default_search": "ytsearch",
+    "quiet": True,
+    "no_warnings": True,
+    # YouTube extraction needs a JS runtime; use the installed Node.
+    "js_runtimes": {"node": {}},
+}
+FFMPEG_OPTS = {
+    # Reconnect if YouTube drops the stream mid-song.
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn",
+}
+IDLE_DISCONNECT_SECONDS = 300
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
+
+
+@dataclass
+class Track:
+    title: str
+    webpage_url: str
+    duration: int | None
+    requested_by: str
+
+    def fmt_duration(self) -> str:
+        if not self.duration:
+            return "live"
+        m, s = divmod(int(self.duration), 60)
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+async def search(query: str, requested_by: str) -> Track:
+    """Resolve a URL or search phrase to a single track."""
+    info = await asyncio.to_thread(ytdl.extract_info, query, download=False)
+    if "entries" in info:
+        if not info["entries"]:
+            raise LookupError("No results found.")
+        info = info["entries"][0]
+    return Track(info["title"], info["webpage_url"], info.get("duration"), requested_by)
+
+
+async def stream_url(track: Track) -> str:
+    """Get a fresh audio stream URL (they expire, so fetch right before playing)."""
+    info = await asyncio.to_thread(ytdl.extract_info, track.webpage_url, download=False)
+    return info["url"]
+
+
+class GuildPlayer:
+    """Queue and playback loop for a single server."""
+
+    def __init__(self, bot: "ChopperBot", guild: discord.Guild):
+        self.bot = bot
+        self.guild = guild
+        self.queue: deque[Track] = deque()
+        self.current: Track | None = None
+        self.text_channel: discord.abc.Messageable | None = None
+        self._next = asyncio.Event()
+        self._wake = asyncio.Event()
+        self._task = bot.loop.create_task(self._loop())
+
+    @property
+    def voice(self) -> discord.VoiceClient | None:
+        return self.guild.voice_client  # type: ignore[return-value]
+
+    def enqueue(self, track: Track):
+        self.queue.append(track)
+        self._wake.set()
+
+    async def _loop(self):
+        while True:
+            self._wake.clear()
+            if not self.queue:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), IDLE_DISCONNECT_SECONDS)
+                except asyncio.TimeoutError:
+                    await self.destroy()
+                    return
+                continue
+
+            track = self.queue.popleft()
+            vc = self.voice
+            if vc is None:
+                self.queue.clear()
+                continue
+
+            try:
+                url = await stream_url(track)
+            except Exception as e:
+                log.exception("Failed to get stream")
+                await self._say(f"Couldn't play **{track.title}**: {e}")
+                continue
+
+            self.current = track
+            self._next.clear()
+            source = discord.FFmpegOpusAudio(url, **FFMPEG_OPTS)
+            vc.play(source, after=lambda err: self.bot.loop.call_soon_threadsafe(self._next.set))
+            await self._say(f"Now playing: **{track.title}** [{track.fmt_duration()}]")
+            await self._next.wait()
+            self.current = None
+
+    async def _say(self, msg: str):
+        if self.text_channel:
+            try:
+                await self.text_channel.send(msg)
+            except discord.HTTPException:
+                pass
+
+    async def destroy(self):
+        self.queue.clear()
+        if self.voice:
+            await self.voice.disconnect()
+        self.bot.players.pop(self.guild.id, None)
+        if self._task is not asyncio.current_task():
+            self._task.cancel()
+
+
+class ChopperBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.voice_states = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.players: dict[int, GuildPlayer] = {}
+
+    async def setup_hook(self):
+        if DEV_GUILD_ID:
+            guild = discord.Object(int(DEV_GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.Forbidden:
+                log.error(
+                    "Couldn't register commands in server %s. Check that DEV_GUILD_ID is your "
+                    "server's ID and that the bot has been invited with the applications.commands scope.",
+                    DEV_GUILD_ID,
+                )
+        else:
+            await self.tree.sync()
+
+    def player_for(self, guild: discord.Guild) -> GuildPlayer:
+        if guild.id not in self.players:
+            self.players[guild.id] = GuildPlayer(self, guild)
+        return self.players[guild.id]
+
+    async def on_voice_state_update(self, member, before, after):
+        # Leave when everyone else has left the channel.
+        vc = member.guild.voice_client
+        if vc and before.channel == vc.channel and not [m for m in vc.channel.members if not m.bot]:
+            player = self.players.get(member.guild.id)
+            if player:
+                await player.destroy()
+            else:
+                await vc.disconnect()
+
+
+bot = ChopperBot()
+
+
+@bot.event
+async def on_ready():
+    log.info("Logged in as %s", bot.user)
+
+
+class NotDJ(app_commands.CheckFailure):
+    pass
+
+
+def dj_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        member = interaction.user
+        role = discord.utils.get(interaction.guild.roles, name=DJ_ROLE)
+        if role is None or member.guild_permissions.manage_guild or role in member.roles:
+            return True
+        raise NotDJ(f"You need the **{DJ_ROLE}** role to control the music.")
+
+    return app_commands.check(predicate)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, NotDJ):
+        msg = str(error)
+    else:
+        log.exception("Command failed", exc_info=error)
+        msg = "Something went wrong."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+async def require_same_channel(interaction: discord.Interaction) -> discord.VoiceClient | None:
+    vc = interaction.guild.voice_client
+    user_vc = interaction.user.voice
+    if vc is None:
+        await interaction.response.send_message("I'm not playing anything.", ephemeral=True)
+        return None
+    if not user_vc or user_vc.channel != vc.channel:
+        await interaction.response.send_message("Join my voice channel first.", ephemeral=True)
+        return None
+    return vc  # type: ignore[return-value]
+
+
+@bot.tree.command(description="Play a song from YouTube (URL or search terms)")
+@app_commands.describe(query="YouTube link or what to search for")
+@app_commands.guild_only()
+@dj_only()
+async def play(interaction: discord.Interaction, query: str):
+    user_voice = interaction.user.voice
+    if not user_voice or not user_voice.channel:
+        await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    vc = interaction.guild.voice_client
+    if vc is None:
+        vc = await user_voice.channel.connect(self_deaf=True)
+    elif vc.channel != user_voice.channel:
+        await interaction.followup.send(f"I'm already in {vc.channel.mention}.")
+        return
+
+    try:
+        track = await search(query, interaction.user.display_name)
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't find that: {e}")
+        return
+
+    player = bot.player_for(interaction.guild)
+    player.text_channel = interaction.channel
+    busy = player.current is not None or bool(player.queue)
+    player.enqueue(track)
+    if busy:
+        await interaction.followup.send(
+            f"Queued **{track.title}** [{track.fmt_duration()}] at position {len(player.queue)}"
+        )
+    else:
+        await interaction.followup.send(f"Loading **{track.title}**…")
+
+
+@bot.tree.command(description="Skip the current song")
+@app_commands.guild_only()
+@dj_only()
+async def skip(interaction: discord.Interaction):
+    vc = await require_same_channel(interaction)
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop()  # triggers the `after` callback, which advances the queue
+        await interaction.response.send_message("Skipped.")
+    elif vc:
+        await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+
+
+@bot.tree.command(description="Pause playback")
+@app_commands.guild_only()
+@dj_only()
+async def pause(interaction: discord.Interaction):
+    vc = await require_same_channel(interaction)
+    if vc and vc.is_playing():
+        vc.pause()
+        await interaction.response.send_message("Paused.")
+    elif vc:
+        await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+
+
+@bot.tree.command(description="Resume playback")
+@app_commands.guild_only()
+@dj_only()
+async def resume(interaction: discord.Interaction):
+    vc = await require_same_channel(interaction)
+    if vc and vc.is_paused():
+        vc.resume()
+        await interaction.response.send_message("Resumed.")
+    elif vc:
+        await interaction.response.send_message("Not paused.", ephemeral=True)
+
+
+@bot.tree.command(description="Show the queue")
+@app_commands.guild_only()
+async def queue(interaction: discord.Interaction):
+    player = bot.players.get(interaction.guild.id)
+    if not player or (not player.current and not player.queue):
+        await interaction.response.send_message("The queue is empty.", ephemeral=True)
+        return
+    lines = []
+    if player.current:
+        lines.append(f"**Now:** {player.current.title} [{player.current.fmt_duration()}]")
+    for i, t in enumerate(list(player.queue)[:15], 1):
+        lines.append(f"`{i}.` {t.title} [{t.fmt_duration()}] — {t.requested_by}")
+    if len(player.queue) > 15:
+        lines.append(f"…and {len(player.queue) - 15} more")
+    await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(description="Clear the queue and leave the voice channel")
+@app_commands.guild_only()
+@dj_only()
+async def stop(interaction: discord.Interaction):
+    vc = await require_same_channel(interaction)
+    if not vc:
+        return
+    player = bot.players.get(interaction.guild.id)
+    if player:
+        await player.destroy()
+    else:
+        await vc.disconnect()
+    await interaction.response.send_message("Stopped and left the channel.")
+
+
+if __name__ == "__main__":
+    discord.utils.setup_logging()
+    bot.run(TOKEN, log_handler=None)
