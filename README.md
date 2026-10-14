@@ -52,9 +52,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### 2. Invite the bot to your server
 
+To add Chopper 2.0, the copy of this bot run by the author, open its [install link](https://discord.com/oauth2/authorize?client_id=701629322280173648), choose **Add to Server** and pick the server. It only plays music while the author has it running.
+
+To invite your own copy:
+
 1. In the Developer Portal, open **OAuth2 → URL Generator**.
 2. Under **Scopes**, tick `bot` and `applications.commands`.
-3. Under **Bot Permissions**, tick **Connect**, **Speak** and **Send Messages**.
+3. Under **Bot Permissions**, tick **View Channels**, **Connect**, **Speak** and **Send Messages**.
 4. Open the generated link and choose your server.
 
 ### 3. Download and configure the bot
