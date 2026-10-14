@@ -6,5 +6,12 @@ dependencies = [
     "discord-py[voice]>=2.7.1",
     "python-dotenv>=1.2.4",
     "spotipy>=2.26.0",
-    "yt-dlp[default]>=2026.8.19",
+    # yt-dlp[default] minus brotli, which has no wheels for some Pythons/platforms
+    "yt-dlp>=2026.8.19",
+    "certifi>=2026.7.22",
+    "mutagen>=1.48.1",
+    "pycryptodomex>=3.24.1",
+    "requests>=2.34.2",
+    "websockets>=17.2",
+    "yt-dlp-ejs>=0.8.0",
 ]
