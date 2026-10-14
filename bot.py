@@ -1,11 +1,14 @@
 import asyncio
+import json
 import logging
 import os
 import re
 from collections import deque
 from dataclasses import dataclass
 
+import aiohttp
 import discord
+import spotipy
 import yt_dlp
 from discord import app_commands
 from dotenv import load_dotenv
@@ -17,6 +20,10 @@ DEV_GUILD_ID = os.environ.get("DEV_GUILD_ID")
 # Only members with this role (or server admins) can control playback.
 # If no role with this name exists in the server, everyone can.
 DJ_ROLE = os.environ.get("DJ_ROLE", "DJ")
+# Optional: Spotify app credentials (needs Spotify Premium). Without them, Spotify links
+# are read from Spotify's public web player instead.
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
 
 log = logging.getLogger("chopper")
 
@@ -44,12 +51,26 @@ ytdl_playlist = yt_dlp.YoutubeDL(
 )
 # "list=" in a YouTube URL, except auto-generated mixes (list=RD...), which never end.
 PLAYLIST_RE = re.compile(r"[?&]list=(?!RD)[\w-]+")
+SPOTIFY_RE = re.compile(r"open\.spotify\.com/(?:intl-[\w-]+/)?(?:embed/)?(track|album|playlist)/(\w+)")
+NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
+
+spotify = (
+    spotipy.Spotify(
+        auth_manager=spotipy.SpotifyClientCredentials(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+        retries=0,
+    )
+    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET
+    else None
+)
+# (artists, song title, duration in ms)
+SpotifySong = tuple[str, str, int | None]
 
 
 @dataclass
 class Track:
     title: str
-    webpage_url: str
+    # A video URL, or for Spotify tracks a YouTube search that's run right before playing.
+    source: str
     duration: int | None
     requested_by: str
 
@@ -89,9 +110,94 @@ async def load_playlist(url: str, requested_by: str) -> tuple[str, list[Track]]:
     return info.get("title") or "playlist", tracks
 
 
+def _spotify_api_songs(kind: str, spotify_id: str) -> tuple[str | None, list[SpotifySong]]:
+    """Read a Spotify track, album or playlist through the official Web API."""
+    if kind == "track":
+        title, items = None, [spotify.track(spotify_id)]
+    else:
+        if kind == "album":
+            title = spotify.album(spotify_id)["name"]
+            page = spotify.album_tracks(spotify_id)
+        else:
+            title = spotify.playlist(spotify_id)["name"]
+            page = spotify.playlist_items(spotify_id, additional_types=("track",))
+        items = []
+        while page and len(items) < MAX_PLAYLIST_TRACKS:
+            items += page["items"]
+            page = spotify.next(page) if page.get("next") else None
+        if kind == "playlist":
+            # Playlist entries wrap the track; newer API versions call the field "item".
+            items = [e.get("item") or e.get("track") for e in items]
+    return title, [
+        (", ".join(a["name"] for a in t["artists"]), t["name"], t.get("duration_ms"))
+        for t in items[:MAX_PLAYLIST_TRACKS]
+        # Skip podcast episodes and removed tracks.
+        if t and t.get("type") == "track" and t.get("name")
+    ]
+
+
+async def _spotify_embed_songs(kind: str, spotify_id: str) -> tuple[str | None, list[SpotifySong]]:
+    """Read a Spotify track, album or playlist from its public embed player page.
+
+    Needs no API key, but the page shows at most 100 songs.
+    """
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        async with session.get(f"https://open.spotify.com/embed/{kind}/{spotify_id}") as resp:
+            resp.raise_for_status()
+            page = await resp.text()
+    try:
+        props = json.loads(NEXT_DATA_RE.search(page).group(1))["props"]["pageProps"]
+        # Missing and private items still load, as a "Page not found" page.
+        if props.get("status") == 404:
+            raise LookupError(f"Spotify couldn't find that {kind}. Private playlists can't be read.")
+        entity = props["state"]["data"]["entity"]
+    except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as e:
+        raise LookupError("Couldn't read that Spotify link. Spotify may have changed its page.") from e
+
+    if kind == "track":
+        return None, [(", ".join(a["name"] for a in entity["artists"]), entity["name"], entity.get("duration"))]
+    return entity.get("name"), [
+        # Artists come as one string separated by non-breaking spaces.
+        (t["subtitle"].replace("\xa0", " "), t["title"], t.get("duration"))
+        for t in entity.get("trackList") or []
+        if t.get("entityType") == "track"  # skip podcast episodes
+    ][:MAX_PLAYLIST_TRACKS]
+
+
+async def load_spotify(url: str, requested_by: str) -> tuple[str | None, list[Track]]:
+    """Resolve a Spotify link to tracks that are searched for on YouTube when they play.
+
+    Uses the Web API when credentials are set, and the public embed page otherwise, or when
+    the API refuses (it can't read some playlists made by Spotify itself).
+    """
+    kind, spotify_id = SPOTIFY_RE.search(url).groups()
+    songs = None
+    if spotify:
+        try:
+            title, songs = await asyncio.to_thread(_spotify_api_songs, kind, spotify_id)
+        except spotipy.SpotifyOauthError as e:
+            log.error("Spotify rejected SPOTIFY_CLIENT_ID/SECRET (%s), using the embed page instead", e)
+        except spotipy.SpotifyException as e:
+            log.warning("Spotify API couldn't read %s %s (%s), trying the embed page", kind, spotify_id, e.http_status)
+    if songs is None:
+        title, songs = await _spotify_embed_songs(kind, spotify_id)
+
+    tracks = []
+    for artists, song, duration_ms in songs:
+        name = f"{artists} - {song}"
+        tracks.append(Track(name, f"ytsearch1:{name} audio", duration_ms // 1000 if duration_ms else None, requested_by))
+    if not tracks:
+        raise LookupError(f"That {kind} has no playable songs.")
+    return title, tracks
+
+
 async def stream_url(track: Track) -> str:
     """Get a fresh audio stream URL (they expire, so fetch right before playing)."""
-    info = await asyncio.to_thread(ytdl.extract_info, track.webpage_url, download=False)
+    info = await asyncio.to_thread(ytdl.extract_info, track.source, download=False)
+    if "entries" in info:
+        if not info["entries"]:
+            raise LookupError("No match found on YouTube.")
+        info = info["entries"][0]
     return info["url"]
 
 
@@ -251,8 +357,8 @@ async def require_same_channel(interaction: discord.Interaction) -> discord.Voic
     return vc  # type: ignore[return-value]
 
 
-@bot.tree.command(description="Play a song or playlist from YouTube (URL or search terms)")
-@app_commands.describe(query="YouTube video or playlist link, or what to search for")
+@bot.tree.command(description="Play a song or playlist from YouTube or Spotify (URL or search terms)")
+@app_commands.describe(query="YouTube or Spotify link, or what to search for")
 @app_commands.guild_only()
 @dj_only()
 async def play(interaction: discord.Interaction, query: str):
@@ -271,7 +377,9 @@ async def play(interaction: discord.Interaction, query: str):
         return
 
     try:
-        if is_playlist(query):
+        if SPOTIFY_RE.search(query):
+            playlist_title, tracks = await load_spotify(query, interaction.user.display_name)
+        elif is_playlist(query):
             playlist_title, tracks = await load_playlist(query, interaction.user.display_name)
         else:
             playlist_title, tracks = None, [await search(query, interaction.user.display_name)]

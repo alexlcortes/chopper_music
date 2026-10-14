@@ -1,12 +1,12 @@
 # Chopper Music
 
-A Discord music bot that plays YouTube audio in your server's voice channels. Everyone in the voice channel hears the same music, and people can queue songs with slash commands.
+A Discord music bot that plays YouTube audio in your server's voice channels, and can play Spotify links by finding each song on YouTube. Everyone in the voice channel hears the same music, and people can queue songs with slash commands.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/play <link or search>` | Joins your voice channel and plays the song, or adds it to the queue. Accepts a YouTube playlist link too, and queues up to 100 of its songs. |
+| `/play <link or search>` | Joins your voice channel and plays the song, or adds it to the queue. Also accepts YouTube playlist links, and Spotify song, album and playlist links (see [Spotify links](#spotify-links)). Playlists and albums queue up to 100 songs. |
 | `/skip` | Skips the current song |
 | `/pause` / `/resume` | Pauses or resumes playback |
 | `/queue` | Shows what's playing now and what's next |
@@ -76,6 +76,7 @@ DJ_ROLE=DJ
 | `DISCORD_TOKEN` | Yes | The bot token from step 1 |
 | `DEV_GUILD_ID` | No | Your server's ID. When it's set, slash commands appear right away; without it, they can take up to an hour. To copy the ID, turn on **User Settings → Advanced → Developer Mode**, then right-click your server's icon and choose **Copy Server ID**. |
 | `DJ_ROLE` | No | The role allowed to control the music. Defaults to `DJ`. See [Who can control the music](#who-can-control-the-music). |
+| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | No | Spotify app keys for reading Spotify links through the official API. Needs Spotify Premium. Leave empty to use the public web player. See [Spotify links](#spotify-links). |
 
 Never commit `.env`. It's already listed in `.gitignore`.
 
@@ -88,6 +89,54 @@ uv run bot.py
 The first run installs Python and the dependencies, which takes a moment. When you see `Logged in as <your bot>`, join a voice channel in your server and try `/play never gonna give you up`.
 
 The bot stays online only while this command is running. To keep it online all the time, run it on a computer or server that stays on.
+
+### 5. (Optional) Choose how Spotify links work
+
+Spotify links work without any extra setup. If you have Spotify Premium, you can switch to Spotify's official API instead. See [Spotify links](#spotify-links) to compare the two options.
+
+## Spotify links
+
+Spotify doesn't let bots stream its audio. For a Spotify song, album or playlist link, the bot gets the song names from Spotify and plays each song from YouTube.
+
+There are two ways for the bot to get those song names. Pick whichever suits you:
+
+| | Option 1: Public web player | Option 2: Spotify Web API |
+|---|---|---|
+| **Setup** | None. This is the default. | Create a Spotify app and add its keys to `.env` |
+| **Spotify account** | Not needed | Spotify **Premium** needed to create the app |
+| **Reliability** | Unofficial, so it can break if Spotify changes its website | Official and stable |
+| **Spotify's own playlists** (like **Today's Top Hits**) | Work | Some are blocked, so the bot reads those through option 1 instead |
+| **Songs per album or playlist** | Up to 100 | Up to 100 |
+
+The bot uses option 2 when `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` are set in `.env`, and option 1 otherwise.
+
+### Option 1: Public web player (default)
+
+There's nothing to set up. Leave `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` empty and Spotify links just work.
+
+The bot reads the song names from Spotify's public web player, the same page websites use to embed Spotify. It isn't an official API, so if Spotify links stop working while YouTube still does, Spotify has probably changed that page and the bot needs an update. Switching to option 2 avoids this.
+
+### Option 2: Spotify Web API (needs Premium)
+
+1. Log in to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) with a Premium account and click **Create app**. Spotify only lets Premium accounts use the Web API. On a free account, the **Web API** option is greyed out, so use option 1.
+2. Give the app any name and description. For **Redirect URI**, enter `http://127.0.0.1:8080` (the bot doesn't use it, but the form requires one). Tick **Web API** and save.
+3. Open the app's **Settings** and copy the **Client ID**. Click **View client secret** and copy that too.
+4. Add both to `.env` and restart the bot:
+
+```
+SPOTIFY_CLIENT_ID=your-client-id
+SPOTIFY_CLIENT_SECRET=your-client-secret
+```
+
+Keep the client secret private, like the Discord token.
+
+If the API refuses a link, as it does for some playlists made by Spotify itself, the bot reads that link through option 1 instead. If the keys are wrong, Spotify links still work through option 1, and the bot logs `Spotify rejected SPOTIFY_CLIENT_ID/SECRET` when someone plays one.
+
+### Good to know (both options)
+
+- Each song is looked up on YouTube right before it plays, so now and then you might get a live version, cover or music video instead of the album track.
+- Private playlists can't be read, and podcast episodes in a playlist are skipped.
+- Shortened `spotify.link` links don't work. Use **Share → Copy link** in the desktop app or the web player, which gives an `open.spotify.com` link.
 
 ## Who can control the music
 
