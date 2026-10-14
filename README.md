@@ -14,6 +14,8 @@ A Discord music bot that plays YouTube audio in your server's voice channels, an
 
 The bot leaves on its own when everyone else has left the voice channel, or after 5 minutes with nothing playing.
 
+YouTube's ads never play, because the bot fetches only the audio. The bot also skips sponsor reads, "like and subscribe" reminders and the talking or skits in music videos, using timestamps from [SponsorBlock](https://sponsor.ajay.app), a free community database. Videos nobody has marked yet play in full, as do all videos when SponsorBlock is down. The **Now playing** message says how much is being skipped.
+
 > Discord only lets bots join voice channels in a server. The bot can't join calls in DMs or group DMs.
 
 ## Requirements

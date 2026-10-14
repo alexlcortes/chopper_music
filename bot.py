@@ -41,6 +41,10 @@ FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+SPONSORBLOCK_API = "https://sponsor.ajay.app/api/skipSegments"
+# Parts of YouTube videos to skip: sponsor reads, plugs for the creator's own stuff,
+# "like and subscribe" reminders, and talking or skits in music videos.
+SPONSORBLOCK_CATEGORIES = ["sponsor", "selfpromo", "interaction", "music_offtopic"]
 IDLE_DISCONNECT_SECONDS = 300
 MAX_PLAYLIST_TRACKS = 100
 
@@ -64,6 +68,14 @@ spotify = (
 )
 # (artists, song title, duration in ms)
 SpotifySong = tuple[str, str, int | None]
+# (start, end) in seconds
+Segment = tuple[float, float]
+
+
+def fmt_time(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
 @dataclass
@@ -75,11 +87,7 @@ class Track:
     requested_by: str
 
     def fmt_duration(self) -> str:
-        if not self.duration:
-            return "live"
-        m, s = divmod(int(self.duration), 60)
-        h, m = divmod(m, 60)
-        return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+        return fmt_time(self.duration) if self.duration else "live"
 
 
 async def search(query: str, requested_by: str) -> Track:
@@ -191,14 +199,43 @@ async def load_spotify(url: str, requested_by: str) -> tuple[str | None, list[Tr
     return title, tracks
 
 
-async def stream_url(track: Track) -> str:
-    """Get a fresh audio stream URL (they expire, so fetch right before playing)."""
+async def sponsor_segments(video_id: str) -> list[Segment]:
+    """Get the parts of a YouTube video to skip from SponsorBlock."""
+    params = {"videoID": video_id, "categories": json.dumps(SPONSORBLOCK_CATEGORIES), "actionType": "skip"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(SPONSORBLOCK_API, params=params) as resp:
+                if resp.status == 404:  # nobody has submitted segments for this video
+                    return []
+                resp.raise_for_status()
+                data = await resp.json()
+        return [(float(s["segment"][0]), float(s["segment"][1])) for s in data]
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError) as e:
+        # SponsorBlock is a free community service; play the whole video if it's down.
+        log.warning("SponsorBlock lookup failed for %s (%r), playing without skipping", video_id, e)
+        return []
+
+
+async def stream_url(track: Track) -> tuple[str, list[Segment]]:
+    """Get a fresh audio stream URL (they expire, so fetch right before playing) and the parts to skip."""
     info = await asyncio.to_thread(ytdl.extract_info, track.source, download=False)
     if "entries" in info:
         if not info["entries"]:
             raise LookupError("No match found on YouTube.")
         info = info["entries"][0]
-    return info["url"]
+    if info.get("extractor_key") != "Youtube":
+        return info["url"], []
+    return info["url"], await sponsor_segments(info["id"])
+
+
+def ffmpeg_opts(skip: list[Segment]) -> dict[str, str]:
+    """FFmpeg options that play the stream with the given segments cut out."""
+    if not skip:
+        return FFMPEG_OPTS
+    # Drop audio inside any segment, then close the gaps in the timestamps.
+    inside = "+".join(f"between(t,{start:.3f},{end:.3f})" for start, end in skip)
+    audio_filter = f"aselect='not({inside})',asetpts=N/SR/TB"
+    return FFMPEG_OPTS | {"options": f'{FFMPEG_OPTS["options"]} -af "{audio_filter}"'}
 
 
 class GuildPlayer:
@@ -240,7 +277,7 @@ class GuildPlayer:
                 continue
 
             try:
-                url = await stream_url(track)
+                url, skip = await stream_url(track)
             except Exception as e:
                 log.exception("Failed to get stream")
                 await self._say(f"Couldn't play **{track.title}**: {e}")
@@ -248,9 +285,11 @@ class GuildPlayer:
 
             self.current = track
             self._next.clear()
-            source = discord.FFmpegOpusAudio(url, **FFMPEG_OPTS)
+            source = discord.FFmpegOpusAudio(url, **ffmpeg_opts(skip))
             vc.play(source, after=lambda err: self.bot.loop.call_soon_threadsafe(self._next.set))
-            await self._say(f"Now playing: **{track.title}** [{track.fmt_duration()}]")
+            skipped = sum(end - start for start, end in skip)
+            note = f", skipping {fmt_time(skipped)} of sponsors and non-music" if skipped >= 1 else ""
+            await self._say(f"Now playing: **{track.title}** [{track.fmt_duration()}{note}]")
             await self._next.wait()
             self.current = None
 
