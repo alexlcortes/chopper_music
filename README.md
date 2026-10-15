@@ -9,6 +9,7 @@ A Discord music bot that plays YouTube audio in your server's voice channels, an
 | `/play <link or search>` | Joins your voice channel and plays the song, or adds it to the queue. Also accepts YouTube playlist links, and Spotify song, album and playlist links (see [Spotify links](#spotify-links)). Playlists and albums queue up to 100 songs. |
 | `/skip` | Skips the current song |
 | `/pause` / `/resume` | Pauses or resumes playback |
+| `/volume <0-100>` | Sets the volume for everyone in the channel. Leave out the number to see the current volume. Goes back to the starting volume (30% unless `DEFAULT_VOLUME` is set) when the bot leaves. |
 | `/queue` | Shows what's playing now and what's next |
 | `/stop` | Clears the queue and leaves the voice channel |
 
@@ -82,6 +83,7 @@ DJ_ROLE=DJ
 | `DISCORD_TOKEN` | Yes | The bot token from step 1 |
 | `DEV_GUILD_ID` | No | Your server's ID. When it's set, slash commands appear right away; without it, they can take up to an hour. To copy the ID, turn on **User Settings → Advanced → Developer Mode**, then right-click your server's icon and choose **Copy Server ID**. |
 | `DJ_ROLE` | No | The role allowed to control the music. Defaults to `DJ`. See [Who can control the music](#who-can-control-the-music). |
+| `DEFAULT_VOLUME` | No | The volume (0–100) the bot starts at each time it joins a voice channel. Defaults to `30`. |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | No | Spotify app keys for reading Spotify links through the official API. Needs Spotify Premium. Leave empty to use the public web player. See [Spotify links](#spotify-links). |
 
 Never commit `.env`. It's already listed in `.gitignore`.
@@ -146,7 +148,7 @@ If the API refuses a link, as it does for some playlists made by Spotify itself,
 
 ## Who can control the music
 
-`/play`, `/skip`, `/pause`, `/resume` and `/stop` are limited to:
+`/play`, `/skip`, `/pause`, `/resume`, `/volume` and `/stop` are limited to:
 
 - members with the role named in `DJ_ROLE` (default `DJ`)
 - members with the **Manage Server** permission
@@ -162,4 +164,5 @@ For finer control, use **Server Settings → Integrations → *your bot*** to al
 - **The slash commands don't show up.** Set `DEV_GUILD_ID`, restart the bot and reload Discord (Ctrl+R, or Cmd+R on macOS). Check that the invite link included the `applications.commands` scope.
 - **`403 Forbidden (error code: 50001): Missing Access` on startup.** `DEV_GUILD_ID` is wrong, or the bot hasn't been invited to that server.
 - **The bot joins but there's no sound, or songs fail to play.** Check that FFmpeg and Node.js are installed and on your `PATH` (`ffmpeg -version`, `node --version`). If YouTube playback breaks after working before, update yt-dlp with `uv lock --upgrade-package yt-dlp`.
+- **The log says `Couldn't find libopus`.** discord.py needs the Opus library to send audio. It's normally installed along with FFmpeg; if not, run `brew install opus` on macOS or `sudo apt install libopus0` on Linux.
 - **The first run fails while building `pynacl`, `cffi` or `davey`, asking for a compiler.** There are no prebuilt packages for 32-bit Raspberry Pi OS or Windows on ARM. Use a 64-bit OS (64-bit Raspberry Pi OS works), or install build tools: `sudo apt install build-essential python3-dev libffi-dev` on Raspberry Pi OS, or the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and [Rust](https://rustup.rs/) on Windows on ARM (`davey` is written in Rust).

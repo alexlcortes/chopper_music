@@ -24,6 +24,8 @@ DJ_ROLE = os.environ.get("DJ_ROLE", "DJ")
 # are read from Spotify's public web player instead.
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
+# Volume (0-100) the bot starts at each time it joins a voice channel.
+DEFAULT_VOLUME = max(0, min(100, int(os.environ.get("DEFAULT_VOLUME", "30"))))
 
 log = logging.getLogger("chopper")
 
@@ -238,6 +240,25 @@ def ffmpeg_opts(skip: list[Segment]) -> dict[str, str]:
     return FFMPEG_OPTS | {"options": f'{FFMPEG_OPTS["options"]} -af "{audio_filter}"'}
 
 
+def load_opus():
+    """Load libopus, which discord.py needs to encode audio after changing its volume.
+
+    It comes with FFmpeg on macOS and Linux and is bundled with discord.py on Windows, but
+    Python doesn't look in Homebrew's folders on its own.
+    """
+    try:
+        discord.opus._load_default()
+    except OSError:
+        pass
+    for path in ("/opt/homebrew/lib/libopus.dylib", "/usr/local/lib/libopus.dylib"):
+        if discord.opus.is_loaded():
+            return
+        if os.path.exists(path):
+            discord.opus.load_opus(path)
+    if not discord.opus.is_loaded():
+        log.error("Couldn't find libopus, so songs won't play. Install it with your package manager (opus/libopus0).")
+
+
 class GuildPlayer:
     """Queue and playback loop for a single server."""
 
@@ -247,6 +268,8 @@ class GuildPlayer:
         self.queue: deque[Track] = deque()
         self.current: Track | None = None
         self.text_channel: discord.abc.Messageable | None = None
+        # 0.0 to 1.0; kept until the bot leaves, so it carries over to the next song.
+        self.volume = DEFAULT_VOLUME / 100
         self._next = asyncio.Event()
         self._wake = asyncio.Event()
         self._task = bot.loop.create_task(self._loop())
@@ -285,7 +308,8 @@ class GuildPlayer:
 
             self.current = track
             self._next.clear()
-            source = discord.FFmpegOpusAudio(url, **ffmpeg_opts(skip))
+            # Decode to PCM so the volume can change mid-song; discord.py encodes it to Opus.
+            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(url, **ffmpeg_opts(skip)), self.volume)
             vc.play(source, after=lambda err: self.bot.loop.call_soon_threadsafe(self._next.set))
             skipped = sum(end - start for start, end in skip)
             note = f", skipping {fmt_time(skipped)} of sponsors and non-music" if skipped >= 1 else ""
@@ -484,6 +508,24 @@ async def resume(interaction: discord.Interaction):
         await interaction.response.send_message("Not paused.", ephemeral=True)
 
 
+@bot.tree.command(description="Set the volume for everyone, or show it")
+@app_commands.describe(level="0 to 100 (leave out to see the current volume)")
+@app_commands.guild_only()
+@dj_only()
+async def volume(interaction: discord.Interaction, level: app_commands.Range[int, 0, 100] | None = None):
+    vc = await require_same_channel(interaction)
+    if not vc:
+        return
+    player = bot.player_for(interaction.guild)
+    if level is None:
+        await interaction.response.send_message(f"Volume is {round(player.volume * 100)}%.", ephemeral=True)
+        return
+    player.volume = level / 100
+    if isinstance(vc.source, discord.PCMVolumeTransformer):
+        vc.source.volume = player.volume
+    await interaction.response.send_message(f"Volume set to {level}%.")
+
+
 @bot.tree.command(description="Show the queue")
 @app_commands.guild_only()
 async def queue(interaction: discord.Interaction):
@@ -518,4 +560,5 @@ async def stop(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     discord.utils.setup_logging()
+    load_opus()
     bot.run(TOKEN, log_handler=None)
