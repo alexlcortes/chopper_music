@@ -25,7 +25,7 @@ DJ_ROLE = os.environ.get("DJ_ROLE", "DJ")
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
 # Volume (0-100) the bot starts at each time it joins a voice channel.
-DEFAULT_VOLUME = max(0, min(100, int(os.environ.get("DEFAULT_VOLUME", "30"))))
+DEFAULT_VOLUME = max(0, min(100, int(os.environ.get("DEFAULT_VOLUME") or "30")))
 
 log = logging.getLogger("chopper")
 
