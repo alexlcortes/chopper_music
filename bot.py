@@ -57,7 +57,13 @@ ytdl_playlist = yt_dlp.YoutubeDL(
 )
 # "list=" in a YouTube URL, except auto-generated mixes (list=RD...), which never end.
 PLAYLIST_RE = re.compile(r"[?&]list=(?!RD)[\w-]+")
-SPOTIFY_RE = re.compile(r"open\.spotify\.com/(?:intl-[\w-]+/)?(?:embed/)?(track|album|playlist)/(\w+)")
+SPOTIFY_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-[\w-]+/)?(?:embed/)?|spotify:)(track|album|playlist)[/:](\w+)"
+)
+# Any Spotify link, including artists and podcasts, and the short links the mobile app shares.
+SPOTIFY_ANY_RE = re.compile(r"open\.spotify\.com/|spotify:\w+:|(?:spotify\.link|spotify\.app\.link)/")
+SPOTIFY_SHORT_RE = re.compile(r"https?://(?:spotify\.link/|spotify\.app\.link/|open\.spotify\.com/s/)\S+")
+CANONICAL_RE = re.compile(r'<link rel="canonical" href="([^"]+)"')
 NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
 
 spotify = (
@@ -174,13 +180,33 @@ async def _spotify_embed_songs(kind: str, spotify_id: str) -> tuple[str | None, 
     ][:MAX_PLAYLIST_TRACKS]
 
 
+async def expand_spotify_link(url: str) -> str:
+    """Follow a Spotify short link (spotify.link/..., open.spotify.com/s/...) to the page it points to."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        async with session.get(url) as resp:
+            if SPOTIFY_RE.search(str(resp.url)):
+                return str(resp.url)
+            # Some short links serve the page itself, or redirect with JavaScript instead.
+            page = await resp.text()
+    if match := CANONICAL_RE.search(page):
+        return match.group(1)
+    if match := re.search(r"https://open\.spotify\.com/[^\s\"'<>]+", page):
+        return match.group()
+    raise LookupError("Couldn't open that Spotify link.")
+
+
 async def load_spotify(url: str, requested_by: str) -> tuple[str | None, list[Track]]:
     """Resolve a Spotify link to tracks that are searched for on YouTube when they play.
 
     Uses the Web API when credentials are set, and the public embed page otherwise, or when
     the API refuses (it can't read some playlists made by Spotify itself).
     """
-    kind, spotify_id = SPOTIFY_RE.search(url).groups()
+    if short := SPOTIFY_SHORT_RE.search(url):
+        url = await expand_spotify_link(short.group())
+    match = SPOTIFY_RE.search(url)
+    if not match:
+        raise LookupError("I can only play Spotify songs, albums and playlists, not artists or podcasts.")
+    kind, spotify_id = match.groups()
     songs = None
     if spotify:
         try:
@@ -440,7 +466,7 @@ async def play(interaction: discord.Interaction, query: str):
         return
 
     try:
-        if SPOTIFY_RE.search(query):
+        if SPOTIFY_ANY_RE.search(query):
             playlist_title, tracks = await load_spotify(query, interaction.user.display_name)
         elif is_playlist(query):
             playlist_title, tracks = await load_playlist(query, interaction.user.display_name)
